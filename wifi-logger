@@ -210,7 +210,7 @@ show_summary() {
     BEGIN {
       why["router_unreachable"] = "could not reach the router (Wi-Fi/router problem)"
       why["internet_down"] = "router fine, internet down (upstream/provider)"
-      why["wifi_disconnected"] = "Wi-Fi connection dropped"
+      why["wifi_disconnected"] = "not on any Wi-Fi (network vanished, or the Mac left the area)"
       why["ap_link"] = "nearby access point answered, router did not (link between access points)"
     }
     NR == 1 { next }
@@ -222,6 +222,14 @@ show_summary() {
       if (in_ep && t - prev > 150) finish(prev + 60)
       prev = t
       if (s == "wifi_off" || s == "waking") { finish(t); next }
+      # Being on no Wi-Fi looks the same whether the network vanished or the Mac left the area,
+      # so list it with the outages but keep it out of the percentages.
+      if (s == "wifi_disconnected") {
+        away++
+        if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1 }
+        ep_kinds[s]++
+        next
+      }
       n++; count[s]++
       ap_link = (s == "router_unreachable" && $29 != "" && $29 + 0 < 100)
       if (ap_link) n_ap_link++
@@ -250,8 +258,8 @@ show_summary() {
     END {
       finish(prev + 60)
       if (n == 0) { print "No usable checks yet."; exit }
-      offline = count["router_unreachable"] + count["internet_down"] + count["wifi_disconnected"]
-      printf "Wi-Fi log from %s to %s (%d one-minute checks)\n\n", when(from), when(to), n
+      offline = count["router_unreachable"] + count["internet_down"]
+      printf "Wi-Fi log from %s to %s (%d one-minute checks while connected)\n\n", when(from), when(to), n
       printf "  Working normally:   %5.1f%%\n", 100 * count["ok"] / n
       printf "  Degraded:           %5.1f%%  (online, but packet loss or slow responses)\n", 100 * count["degraded"] / n
       printf "  Offline:            %5.1f%%  (%d min)\n", 100 * offline / n, offline
@@ -260,8 +268,8 @@ show_summary() {
         if (n_ap_link) printf " (nearby access point still answered for %d of them)", n_ap_link
         printf "\n"
         printf "    internet down:      %d min\n", count["internet_down"]
-        printf "    Wi-Fi dropped:      %d min\n", count["wifi_disconnected"]
       }
+      if (away) printf "  Not on any Wi-Fi:   %d min (network vanished, or the Mac was out of range; not counted above)\n", away
       if (nsig) printf "\n  Average signal: %d dBm (-67 or higher is a strong signal)\n", sig / nsig
       if (nst) printf "  Speed tests: %d, download avg %.1f Mbps (min %.1f, max %.1f), upload avg %.1f Mbps\n", nst, dl / nst, mindl, maxdl, ul / nst
       printf "\nOutages: %d\n", ne

@@ -17,7 +17,7 @@ Each check gets one of these labels:
 | `degraded` | online, but packet loss to the router or either internet server, a failed web check, or a web response slower than 3 s |
 | `router_unreachable` | offline, and the router didn't answer (local network problem) |
 | `internet_down` | offline, but the router answered (internet provider problem) |
-| `wifi_disconnected` | the Mac wasn't connected to any Wi-Fi network |
+| `wifi_disconnected` | the Mac wasn't on any Wi-Fi network. That looks the same whether the network vanished or you took the Mac out of range, so the summary lists these periods but leaves them out of the percentages |
 | `wifi_off` | Wi-Fi was turned off on the Mac (not counted) |
 | `waking` | the Mac woke up less than 2 minutes ago and was still reconnecting (not counted) |
 

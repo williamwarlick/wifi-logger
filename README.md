@@ -41,6 +41,16 @@ To run the speed test at a different interval, set it at install time. `0` turns
 SPEEDTEST_EVERY_MIN=60 ./wifi-logger install
 ```
 
+### Mesh Wi-Fi and extenders
+
+On a mesh system (eero, Orbi, Deco) or with an extender, your Mac often connects to a unit that relays wirelessly to the main router. To tell your own Wi-Fi apart from that relay link, also ping the unit you connect to:
+
+```bash
+NEARBY_AP=eero-abcd.local ./wifi-logger install
+```
+
+Use its network name or IP address. For eero, `dns-sd -B _eero._tcp` lists the units, and `dns-sd -L "<name>" _eero._tcp` shows each one's `.local` name. Hold Option and click the Wi-Fi icon to see your BSSID, which identifies the unit you're connected to. When the router stops answering but the nearby unit still does, the summary blames the link between access points.
+
 ## See the results
 
 ```bash

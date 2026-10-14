@@ -12,9 +12,11 @@ CSV="$APP_DIR/wifi-log.csv"
 LAST_SPEEDTEST="$APP_DIR/last-speedtest"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 SPEEDTEST_EVERY_MIN="${SPEEDTEST_EVERY_MIN:-30}"
+# Optional: on a mesh or extender network, the access point you connect to when it isn't the router.
+NEARBY_AP="${NEARBY_AP:-}"
 WEB_CHECK_URL="http://captive.apple.com/hotspot-detect.html"
 
-HEADER="time,unix_time,status,wifi_state,channel,band,channel_width,phy_mode,tx_rate_mbps,signal_dbm,noise_dbm,route_iface,router_ip,router_mac,router_loss_pct,router_ms,cloudflare_loss_pct,cloudflare_ms,google_loss_pct,google_ms,web_http_code,web_ok,dns_ms,web_ms,secs_since_wake,download_mbps,upload_mbps,responsiveness_rpm"
+HEADER="time,unix_time,status,wifi_state,channel,band,channel_width,phy_mode,tx_rate_mbps,signal_dbm,noise_dbm,route_iface,router_ip,router_mac,router_loss_pct,router_ms,cloudflare_loss_pct,cloudflare_ms,google_loss_pct,google_ms,web_http_code,web_ok,dns_ms,web_ms,secs_since_wake,download_mbps,upload_mbps,responsiveness_rpm,nearby_ap_loss_pct,nearby_ap_ms"
 
 # Prints "<loss %> <avg ms>" for 5 quick pings; loss is 100 when nothing answers.
 ping_stats() {
@@ -58,7 +60,7 @@ check() {
 
   local now time since wifi_if wifi_state channel band width phy rate signal noise
   local route route_iface router_ip router_mac router_loss router_ms cf_loss cf_ms g_loss g_ms
-  local web web_code web_ok=0 dns_s web_s status last_test dl="" ul="" rpm=""
+  local web web_code web_ok=0 dns_s web_s status last_test dl="" ul="" rpm="" ap_loss="" ap_ms=""
 
   now=$(date +%s)
   time=$(date '+%Y-%m-%dT%H:%M:%S%z')
@@ -76,6 +78,9 @@ check() {
   if [ -n "$router_ip" ]; then
     router_mac=$(arp -n "$router_ip" 2>/dev/null | awk '{ print $4 }')
     read -r router_loss router_ms <<< "$(ping_stats "$router_ip")"
+  fi
+  if [ -n "$NEARBY_AP" ]; then
+    read -r ap_loss ap_ms <<< "$(ping_stats "$NEARBY_AP")"
   fi
   read -r cf_loss cf_ms <<< "$(ping_stats 1.1.1.1)"
   read -r g_loss g_ms <<< "$(ping_stats 8.8.8.8)"
@@ -111,7 +116,7 @@ check() {
     fi
   fi
 
-  echo "$time,$now,$status,$wifi_state,$channel,$band,$width,$phy,$rate,$signal,$noise,$route_iface,$router_ip,$router_mac,$router_loss,$router_ms,$cf_loss,$cf_ms,$g_loss,$g_ms,${web_code:-000},$web_ok,$(seconds_to_ms "${dns_s:-}"),$(seconds_to_ms "${web_s:-}"),$since,$dl,$ul,$rpm" >> "$CSV"
+  echo "$time,$now,$status,$wifi_state,$channel,$band,$width,$phy,$rate,$signal,$noise,$route_iface,$router_ip,$router_mac,$router_loss,$router_ms,$cf_loss,$cf_ms,$g_loss,$g_ms,${web_code:-000},$web_ok,$(seconds_to_ms "${dns_s:-}"),$(seconds_to_ms "${web_s:-}"),$since,$dl,$ul,$rpm,$ap_loss,$ap_ms" >> "$CSV"
 }
 
 install_agent() {
@@ -140,6 +145,7 @@ install_agent() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>SPEEDTEST_EVERY_MIN</key><string>$SPEEDTEST_EVERY_MIN</string>
+    <key>NEARBY_AP</key><string>$NEARBY_AP</string>
   </dict>
   <key>StartCalendarInterval</key><dict/>
   <key>RunAtLoad</key><true/>
@@ -152,6 +158,7 @@ EOF
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
   launchctl bootstrap "gui/$(id -u)" "$PLIST" || exit 1
   echo "Installed. Checking every minute; speed test every $SPEEDTEST_EVERY_MIN min."
+  [ -n "$NEARBY_AP" ] && echo "Also pinging nearby access point: $NEARBY_AP"
   echo "Log file: $CSV"
   echo "Run './wifi-logger status' in a couple of minutes to see the first checks."
 }
@@ -173,11 +180,14 @@ show_status() {
   [ -s "$CSV" ] || return 0
   echo
   echo "Last 5 checks:"
-  tail -n +2 "$CSV" | tail -n 5 | awk -F, '{
-    speed = ($26 != "") ? sprintf("  speed %s down / %s up Mbps", $26, $27) : ""
-    printf "  %s  %-18s signal %4s dBm  router loss %3s%%  internet %5s ms%s\n",
-      substr($1, 1, 16), $3, $10, $15, $18, speed
-  }'
+  tail -n +2 "$CSV" | tail -n 5 | awk -F, '
+    function ms(v) { return (v == "") ? "  -" : sprintf("%3.0f", v) }
+    {
+      speed = ($26 != "") ? sprintf("  speed %s down / %s up Mbps", $26, $27) : ""
+      ap = ($29 != "") ? sprintf("nearby AP %s ms  ", ms($30)) : ""
+      printf "  %s  %-18s signal %4s dBm  %srouter %s ms, loss %3s%%  internet %s ms%s\n",
+        substr($1, 1, 16), $3, $10, ap, ms($16), $15, ms($18), speed
+    }'
 }
 
 show_summary() {
@@ -197,6 +207,7 @@ show_summary() {
       why["router_unreachable"] = "could not reach the router (Wi-Fi/router problem)"
       why["internet_down"] = "router fine, internet down (upstream/provider)"
       why["wifi_disconnected"] = "Wi-Fi connection dropped"
+      why["ap_link"] = "nearby access point answered, router did not (link between access points)"
     }
     NR == 1 { next }
     {
@@ -208,7 +219,9 @@ show_summary() {
       prev = t
       if (s == "wifi_off" || s == "waking") { finish(t); next }
       n++; count[s]++
-      if (s in why) { if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1; ep_kind = s } }
+      ap_link = (s == "router_unreachable" && $29 != "" && $29 + 0 < 100)
+      if (ap_link) n_ap_link++
+      if (s in why) { if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1; ep_kind = ap_link ? "ap_link" : s } }
       else finish(t)
       if ($10 != "") { sig += $10; nsig++ }
       if ($26 != "") {
@@ -225,6 +238,7 @@ show_summary() {
       else if (s == "degraded") net_deg[key]++
       else net_off[key]++
       if ($16 != "") { net_rms[key] += $16; net_nrms[key]++ }
+      if ($30 != "") { net_ams[key] += $30; net_nams[key]++ }
       if ($26 != "") { net_dl[key] += $26; net_ndl[key]++ }
     }
     END {
@@ -236,7 +250,9 @@ show_summary() {
       printf "  Degraded:           %5.1f%%  (online, but packet loss or slow responses)\n", 100 * count["degraded"] / n
       printf "  Offline:            %5.1f%%  (%d min)\n", 100 * offline / n, offline
       if (offline) {
-        printf "    router unreachable: %d min\n", count["router_unreachable"]
+        printf "    router unreachable: %d min", count["router_unreachable"]
+        if (n_ap_link) printf " (nearby access point still answered for %d of them)", n_ap_link
+        printf "\n"
         printf "    internet down:      %d min\n", count["internet_down"]
         printf "    Wi-Fi dropped:      %d min\n", count["wifi_disconnected"]
       }
@@ -249,6 +265,7 @@ show_summary() {
         k = net_order[i]; c = net_n[k]
         printf "  %s %s: %d checks, %.1f%% ok, %.1f%% degraded, %.1f%% offline", \
           k, (k in net_ip) ? "(" net_ip[k] ")" : "", c, 100 * net_ok[k] / c, 100 * net_deg[k] / c, 100 * net_off[k] / c
+        if (net_nams[k]) printf ", nearby AP avg %.0f ms", net_ams[k] / net_nams[k]
         if (net_nrms[k]) printf ", router avg %.0f ms", net_rms[k] / net_nrms[k]
         if (net_ndl[k]) printf ", download avg %.1f Mbps", net_dl[k] / net_ndl[k]
         printf "\n"

@@ -194,13 +194,17 @@ show_summary() {
   [ -s "$CSV" ] || { echo "No log yet at $CSV"; return 0; }
   awk -F, '
     function when(ts) { return substr(ts, 1, 10) " " substr(ts, 12, 5) }
-    function finish(end_t) {
+    function finish(end_t,   k, top) {
       if (!in_ep) return
       ne++
       ep_at[ne] = ep_label
       ep_min[ne] = int((end_t - ep_t0) / 60 + 0.5)
       if (ep_min[ne] < 1) ep_min[ne] = 1
-      ep_why[ne] = why[ep_kind]
+      # Label the outage by its most common cause.
+      top = ""
+      for (k in ep_kinds) if (top == "" || ep_kinds[k] > ep_kinds[top]) top = k
+      ep_why[ne] = why[top]
+      split("", ep_kinds)
       in_ep = 0
     }
     BEGIN {
@@ -221,8 +225,10 @@ show_summary() {
       n++; count[s]++
       ap_link = (s == "router_unreachable" && $29 != "" && $29 + 0 < 100)
       if (ap_link) n_ap_link++
-      if (s in why) { if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1; ep_kind = ap_link ? "ap_link" : s } }
-      else finish(t)
+      if (s in why) {
+        if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1 }
+        ep_kinds[ap_link ? "ap_link" : s]++
+      } else finish(t)
       if ($10 != "") { sig += $10; nsig++ }
       if ($26 != "") {
         nst++; dl += $26; ul += $27

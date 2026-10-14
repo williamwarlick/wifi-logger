@@ -1,0 +1,270 @@
+#!/bin/bash
+# wifi-logger: records Wi-Fi and internet health once a minute on macOS,
+# so you have timestamped evidence of outages and slow connections.
+#
+# Usage: ./wifi-logger install | uninstall | status | summary | check
+
+set -u
+
+LABEL="local.wifi-logger"
+APP_DIR="$HOME/Library/Application Support/wifi-logger"
+CSV="$APP_DIR/wifi-log.csv"
+LAST_SPEEDTEST="$APP_DIR/last-speedtest"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+SPEEDTEST_EVERY_MIN="${SPEEDTEST_EVERY_MIN:-30}"
+WEB_CHECK_URL="http://captive.apple.com/hotspot-detect.html"
+
+HEADER="time,unix_time,status,wifi_state,channel,band,channel_width,phy_mode,tx_rate_mbps,signal_dbm,noise_dbm,route_iface,router_ip,router_mac,router_loss_pct,router_ms,cloudflare_loss_pct,cloudflare_ms,google_loss_pct,google_ms,web_http_code,web_ok,dns_ms,web_ms,secs_since_wake,download_mbps,upload_mbps,responsiveness_rpm"
+
+# Prints "<loss %> <avg ms>" for 5 quick pings; loss is 100 when nothing answers.
+ping_stats() {
+  local out loss avg
+  out=$(ping -c 5 -i 0.2 -t 4 -q "$1" 2>/dev/null)
+  loss=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9.]*\)% packet loss.*/\1/p')
+  avg=$(printf '%s\n' "$out" | sed -n 's|^round-trip.* = [0-9.]*/\([0-9.]*\)/.*|\1|p')
+  echo "${loss:-100} $avg"
+}
+
+# Prints "state|channel|band|width|phy|rate|signal|noise" for the Wi-Fi interface.
+wifi_info() {
+  system_profiler SPAirPortDataType -json 2>/dev/null | jq -r --arg ifc "$1" '
+    .SPAirPortDataType[0].spairport_airport_interfaces[]? | select(._name == $ifc) |
+    (.spairport_current_network_information // {}) as $n |
+    (try ($n.spairport_network_channel | capture("^(?<ch>[0-9]+) \\((?<band>[^,]+), (?<width>[^)]+)\\)")) catch {}) as $c |
+    (try ($n.spairport_signal_noise | capture("(?<signal>-?[0-9]+) dBm / (?<noise>-?[0-9]+) dBm")) catch {}) as $s |
+    [(.spairport_status_information // "unknown" | sub("^spairport_status_"; "")),
+     $c.ch, $c.band, $c.width, $n.spairport_network_phymode, $n.spairport_network_rate,
+     $s.signal, $s.noise] | map(. // "" | tostring) | join("|")'
+}
+
+boot_or_wake_epoch() {
+  local wake boot
+  wake=$(sysctl -n kern.waketime | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
+  boot=$(sysctl -n kern.boottime | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
+  echo $(( ${wake:-0} > ${boot:-0} ? ${wake:-0} : ${boot:-0} ))
+}
+
+seconds_to_ms() {
+  awk -v s="$1" 'BEGIN { if (s != "") printf "%.0f", s * 1000 }'
+}
+
+check() {
+  mkdir -p "$APP_DIR"
+  # Keep a log written with different columns instead of mixing formats.
+  if [ -s "$CSV" ] && [ "$(head -n 1 "$CSV")" != "$HEADER" ]; then
+    mv "$CSV" "$APP_DIR/wifi-log-before-$(date +%Y%m%d-%H%M%S).csv"
+  fi
+  [ -s "$CSV" ] || echo "$HEADER" > "$CSV"
+
+  local now time since wifi_if wifi_state channel band width phy rate signal noise
+  local route route_iface router_ip router_mac router_loss router_ms cf_loss cf_ms g_loss g_ms
+  local web web_code web_ok=0 dns_s web_s status last_test dl="" ul="" rpm=""
+
+  now=$(date +%s)
+  time=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  since=$(( now - $(boot_or_wake_epoch) ))
+
+  wifi_if=$(networksetup -listallhardwareports | awk '/^Hardware Port: Wi-Fi/ { getline; print $2; exit }')
+  IFS='|' read -r wifi_state channel band width phy rate signal noise <<< "$(wifi_info "$wifi_if")"
+
+  route=$(route -n get default 2>/dev/null)
+  route_iface=$(awk '/interface:/ { print $2 }' <<< "$route")
+  router_ip=$(awk '/gateway:/ { print $2 }' <<< "$route")
+  router_mac=""
+  router_loss=100
+  router_ms=""
+  if [ -n "$router_ip" ]; then
+    router_mac=$(arp -n "$router_ip" 2>/dev/null | awk '{ print $4 }')
+    read -r router_loss router_ms <<< "$(ping_stats "$router_ip")"
+  fi
+  read -r cf_loss cf_ms <<< "$(ping_stats 1.1.1.1)"
+  read -r g_loss g_ms <<< "$(ping_stats 8.8.8.8)"
+  web=$(curl -s --max-time 6 -w '\n%{http_code} %{time_namelookup} %{time_total}' "$WEB_CHECK_URL")
+  read -r web_code dns_s web_s <<< "$(tail -n 1 <<< "$web")"
+  # A captive portal or router error page can also answer 200, so require Apple's success page.
+  if [ "$web_code" = 200 ] && grep -q '<BODY>Success</BODY>' <<< "$web"; then web_ok=1; fi
+
+  # Online if the web check or either internet ping works; degraded if anything was lost or slow.
+  status=$(awk -v w="$wifi_state" -v web_ok="$web_ok" -v web="${web_s:-0}" \
+    -v rl="$router_loss" -v cl="$cf_loss" -v gl="$g_loss" -v since="$since" 'BEGIN {
+      best = (cl + 0 < gl + 0) ? cl + 0 : gl + 0
+      worst = (cl + 0 > gl + 0) ? cl + 0 : gl + 0
+      online = (web_ok || best < 100)
+      if (w ~ /off/) s = "wifi_off"
+      else if (w != "connected") s = "wifi_disconnected"
+      else if (online) s = (rl > 0 || worst > 0 || !web_ok || web > 3) ? "degraded" : "ok"
+      else if (rl >= 100) s = "router_unreachable"
+      else s = "internet_down"
+      # Wi-Fi takes a moment to reconnect after the Mac wakes; do not count that as an outage.
+      if (s != "ok" && s != "degraded" && s != "wifi_off" && since < 120) s = "waking"
+      print s
+    }')
+
+  if [ "$SPEEDTEST_EVERY_MIN" -gt 0 ] && { [ "$status" = ok ] || [ "$status" = degraded ]; }; then
+    last_test=$(cat "$LAST_SPEEDTEST" 2>/dev/null || echo 0)
+    if [ $(( now - last_test )) -ge $(( SPEEDTEST_EVERY_MIN * 60 - 30 )) ]; then
+      echo "$now" > "$LAST_SPEEDTEST"
+      read -r dl ul rpm <<< "$(networkQuality -c -M 20 2>/dev/null | jq -r '
+        select(.dl_throughput != null) |
+        [.dl_throughput / 1e6, (.ul_throughput // 0) / 1e6, (.responsiveness // 0)] |
+        map(. * 10 | round / 10 | tostring) | join(" ")' 2>/dev/null)"
+    fi
+  fi
+
+  echo "$time,$now,$status,$wifi_state,$channel,$band,$width,$phy,$rate,$signal,$noise,$route_iface,$router_ip,$router_mac,$router_loss,$router_ms,$cf_loss,$cf_ms,$g_loss,$g_ms,${web_code:-000},$web_ok,$(seconds_to_ms "${dns_s:-}"),$(seconds_to_ms "${web_s:-}"),$since,$dl,$ul,$rpm" >> "$CSV"
+}
+
+install_agent() {
+  local self tool
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  for tool in /usr/bin/jq /usr/bin/networkQuality; do
+    [ -x "$tool" ] || { echo "wifi-logger needs $tool, which ships with macOS 15 or newer." >&2; exit 1; }
+  done
+
+  mkdir -p "$APP_DIR" "$(dirname "$PLIST")"
+  # Run from a copy so the agent keeps working if this folder moves or sits in Downloads/Documents.
+  cat "$self" > "$APP_DIR/wifi-logger"
+  chmod +x "$APP_DIR/wifi-logger"
+
+  cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$APP_DIR/wifi-logger</string>
+    <string>check</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SPEEDTEST_EVERY_MIN</key><string>$SPEEDTEST_EVERY_MIN</string>
+  </dict>
+  <key>StartCalendarInterval</key><dict/>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$APP_DIR/agent.log</string>
+  <key>StandardErrorPath</key><string>$APP_DIR/agent.log</string>
+</dict>
+</plist>
+EOF
+
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" || exit 1
+  echo "Installed. Checking every minute; speed test every $SPEEDTEST_EVERY_MIN min."
+  echo "Log file: $CSV"
+  echo "Run './wifi-logger status' in a couple of minutes to see the first checks."
+}
+
+uninstall_agent() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  rm -f "$PLIST" "$APP_DIR/wifi-logger"
+  echo "Stopped and removed the background check."
+  [ -s "$CSV" ] && echo "Your log is still at: $CSV"
+}
+
+show_status() {
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "Running: yes (checks every minute)"
+  else
+    echo "Running: no. Run './wifi-logger install' to start."
+  fi
+  echo "Log file: $CSV"
+  [ -s "$CSV" ] || return 0
+  echo
+  echo "Last 5 checks:"
+  tail -n +2 "$CSV" | tail -n 5 | awk -F, '{
+    speed = ($26 != "") ? sprintf("  speed %s down / %s up Mbps", $26, $27) : ""
+    printf "  %s  %-18s signal %4s dBm  router loss %3s%%  internet %5s ms%s\n",
+      substr($1, 1, 16), $3, $10, $15, $18, speed
+  }'
+}
+
+show_summary() {
+  [ -s "$CSV" ] || { echo "No log yet at $CSV"; return 0; }
+  awk -F, '
+    function when(ts) { return substr(ts, 1, 10) " " substr(ts, 12, 5) }
+    function finish(end_t) {
+      if (!in_ep) return
+      ne++
+      ep_at[ne] = ep_label
+      ep_min[ne] = int((end_t - ep_t0) / 60 + 0.5)
+      if (ep_min[ne] < 1) ep_min[ne] = 1
+      ep_why[ne] = why[ep_kind]
+      in_ep = 0
+    }
+    BEGIN {
+      why["router_unreachable"] = "could not reach the router (Wi-Fi/router problem)"
+      why["internet_down"] = "router fine, internet down (upstream/provider)"
+      why["wifi_disconnected"] = "Wi-Fi connection dropped"
+    }
+    NR == 1 { next }
+    {
+      t = $2 + 0; s = $3
+      if (from == "") from = $1
+      to = $1
+      # A gap longer than 2.5 min means the Mac was asleep or off; do not stretch an outage across it.
+      if (in_ep && t - prev > 150) finish(prev + 60)
+      prev = t
+      if (s == "wifi_off" || s == "waking") { finish(t); next }
+      n++; count[s]++
+      if (s in why) { if (!in_ep) { in_ep = 1; ep_t0 = t; ep_label = $1; ep_kind = s } }
+      else finish(t)
+      if ($10 != "") { sig += $10; nsig++ }
+      if ($26 != "") {
+        nst++; dl += $26; ul += $27
+        if (mindl == "" || $26 + 0 < mindl) mindl = $26 + 0
+        if (maxdl == "" || $26 + 0 > maxdl) maxdl = $26 + 0
+      }
+      # Group by router; a check that could not see the router belongs to the last one seen.
+      if ($14 ~ /^[0-9a-f]+:/) { net = $14; net_ip[net] = $13 }
+      key = (net == "") ? "unknown" : net
+      if (!(key in net_n)) net_order[++nnet] = key
+      net_n[key]++
+      if (s == "ok") net_ok[key]++
+      else if (s == "degraded") net_deg[key]++
+      else net_off[key]++
+      if ($16 != "") { net_rms[key] += $16; net_nrms[key]++ }
+      if ($26 != "") { net_dl[key] += $26; net_ndl[key]++ }
+    }
+    END {
+      finish(prev + 60)
+      if (n == 0) { print "No usable checks yet."; exit }
+      offline = count["router_unreachable"] + count["internet_down"] + count["wifi_disconnected"]
+      printf "Wi-Fi log from %s to %s (%d one-minute checks)\n\n", when(from), when(to), n
+      printf "  Working normally:   %5.1f%%\n", 100 * count["ok"] / n
+      printf "  Degraded:           %5.1f%%  (online, but packet loss or slow responses)\n", 100 * count["degraded"] / n
+      printf "  Offline:            %5.1f%%  (%d min)\n", 100 * offline / n, offline
+      if (offline) {
+        printf "    router unreachable: %d min\n", count["router_unreachable"]
+        printf "    internet down:      %d min\n", count["internet_down"]
+        printf "    Wi-Fi dropped:      %d min\n", count["wifi_disconnected"]
+      }
+      if (nsig) printf "\n  Average signal: %d dBm (-67 or higher is a strong signal)\n", sig / nsig
+      if (nst) printf "  Speed tests: %d, download avg %.1f Mbps (min %.1f, max %.1f), upload avg %.1f Mbps\n", nst, dl / nst, mindl, maxdl, ul / nst
+      printf "\nOutages: %d\n", ne
+      for (i = 1; i <= ne; i++) printf "  %s  %4d min  %s\n", when(ep_at[i]), ep_min[i], ep_why[i]
+      printf "\nBy network (router address):\n"
+      for (i = 1; i <= nnet; i++) {
+        k = net_order[i]; c = net_n[k]
+        printf "  %s %s: %d checks, %.1f%% ok, %.1f%% degraded, %.1f%% offline", \
+          k, (k in net_ip) ? "(" net_ip[k] ")" : "", c, 100 * net_ok[k] / c, 100 * net_deg[k] / c, 100 * net_off[k] / c
+        if (net_nrms[k]) printf ", router avg %.0f ms", net_rms[k] / net_nrms[k]
+        if (net_ndl[k]) printf ", download avg %.1f Mbps", net_dl[k] / net_ndl[k]
+        printf "\n"
+      }
+    }
+  ' "$CSV"
+}
+
+case "${1:-}" in
+  check) check ;;
+  install) install_agent ;;
+  uninstall) uninstall_agent ;;
+  status) show_status ;;
+  summary) show_summary ;;
+  *)
+    echo "Usage: $0 install | uninstall | status | summary | check" >&2
+    exit 1
+    ;;
+esac
